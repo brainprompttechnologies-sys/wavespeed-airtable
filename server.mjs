@@ -1,76 +1,78 @@
 import express from "express";
-const f = rec.fields || {};
-const reqIds = (() => { try { return JSON.parse(f["Request IDs"] || "[]"); } catch { return []; } })();
-const startedAt = new Date(f["Created at"] || rec.createdTime || Date.now());
-const cutoff = new Date(startedAt.getTime() + POLL_TIMEOUT_MIN * 60 * 1000);
+import fetch from "node-fetch";
 
 
-const seen = new Set((f["Seen IDs"] || "").split(",").map((s) => s.trim()).filter(Boolean));
-const failed = new Set((f["Failed IDs"] || "").split(",").map((s) => s.trim()).filter(Boolean));
+// ====== ENV ======
+const {
+AIRTABLE_BASE_ID,
+AIRTABLE_TABLE, // Use the TABLE ID (tbl...)
+AIRTABLE_TOKEN,
+WAVESPEED_API_KEY,
+PUBLIC_BASE_URL, // e.g. https://your-app.onrender.com
+} = process.env;
 
 
-const pending = reqIds.filter((id) => !seen.has(id) && !failed.has(id));
-
-
-// Query WaveSpeed for each pending id
-for (const id of pending) {
-try {
-const j = await withRetries(() => getWaveSpeedJob(id), { tries: 3, baseDelay: 600 });
-if (j.status === "succeeded") {
-const urls = (j.outputs || []).map((o) => o.url || o).filter(Boolean);
-const current = await atGet(rec.id);
-const mergedOutput = buildAttachmentMerge(current.fields.Output, urls);
-const newSeen = new Set((current.fields["Seen IDs"] || "").split(",").map((s) => s.trim()).filter(Boolean));
-newSeen.add(id);
-await atUpdate(rec.id, {
-Output: mergedOutput,
-"Seen IDs": Array.from(newSeen).join(","),
-"Last Update": new Date().toISOString(),
-});
-} else if (j.status === "failed") {
-const current = await atGet(rec.id);
-const newFailed = new Set((current.fields["Failed IDs"] || "").split(",").map((s) => s.trim()).filter(Boolean));
-newFailed.add(id);
-await atUpdate(rec.id, {
-"Failed IDs": Array.from(newFailed).join(","),
-"Last Update": new Date().toISOString(),
-});
+if (!AIRTABLE_BASE_ID || !AIRTABLE_TABLE || !AIRTABLE_TOKEN) {
+console.error("Missing Airtable env vars.");
 }
-} catch (e) {
-console.warn("poll job error", id, e.message);
-}
-}
+if (!WAVESPEED_API_KEY) console.error("Missing WAVESPEED_API_KEY");
 
 
-// Timeout finalize
-if (new Date() > cutoff) {
-const current = await atGet(rec.id);
-const f2 = current.fields || {};
-const reqIds2 = (() => { try { return JSON.parse(f2["Request IDs"] || "[]"); } catch { return []; } })();
-const seen2 = new Set((f2["Seen IDs"] || "").split(",").map((s) => s.trim()).filter(Boolean));
-const failed2 = new Set((f2["Failed IDs"] || "").split(",").map((s) => s.trim()).filter(Boolean));
-for (const id of reqIds2) {
-if (!seen2.has(id) && !failed2.has(id)) failed2.add(id);
-}
-await atUpdate(rec.id, {
-"Failed IDs": Array.from(failed2).join(","),
-"Last Update": new Date().toISOString(),
-});
+const WAVESPEED_API_BASE = process.env.WAVESPEED_API_BASE || "https://api.wavespeed.ai"; // adjust if needed
+const MODEL_NAME = process.env.WAVESPEED_MODEL || "Seedream v4"; // adjust if needed
+const SUBMIT_SPACING_MS = parseInt(process.env.SUBMIT_SPACING_MS || "1200", 10);
+const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS || "10000", 10);
+const POLL_TIMEOUT_MIN = parseInt(process.env.POLL_TIMEOUT_MIN || "15", 10); // per job timeout window
+
+
+// ====== APP ======
+const app = express();
+app.use(express.urlencoded({ extended: true }));
+app.use(express.json({ limit: "10mb" }));
+
+
+// ====== HELPERS ======
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+
+async function toDataUrl(url) {
+const res = await fetch(url);
+if (!res.ok) throw new Error(`Fetch image failed ${res.status}`);
+const buf = Buffer.from(await res.arrayBuffer());
+const ct = res.headers.get("content-type") || "image/jpeg"; // best-effort mime sniff
+const b64 = buf.toString("base64");
+return `data:${ct};base64,${b64}`;
 }
 
 
-await finalizeIfDone(rec);
+// ====== AIRTABLE HELPERS ======
+const AT_BASE = `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/${AIRTABLE_TABLE}`;
+const atHeaders = {
+Authorization: `Bearer ${AIRTABLE_TOKEN}`,
+"Content-Type": "application/json",
+};
+
+
+async function atCreate(fields) {
+const body = { records: [{ fields }] };
+const res = await fetch(AT_BASE, { method: "POST", headers: atHeaders, body: JSON.stringify(body) });
+const json = await res.json();
+if (!res.ok) throw new Error(`Airtable create failed: ${res.status} ${JSON.stringify(json)}`);
+return json.records[0];
 }
+
+
+async function atUpdate(recordId, fields) {
+const body = { records: [{ id: recordId, fields }] };
+const res = await fetch(AT_BASE, { method: "PATCH", headers: atHeaders, body: JSON.stringify(body) });
+const json = await res.json();
+if (!res.ok) throw new Error(`Airtable update failed: ${res.status} ${JSON.stringify(json)}`);
+return json.records[0];
 }
 
 
-setInterval(() => {
-pollOnce().catch((e) => console.error("pollOnce error", e));
-}, POLL_INTERVAL_MS);
-
-
-// ====== START ======
-const port = process.env.PORT || 3000;
-app.listen(port, () => {
-console.log(`Server listening on :${port}`);
+async function atGet(recordId) {
+const res = await fetch(`${AT_BASE}/${recordId}`, { headers: { Authorization: `Bearer ${AIRTABLE_TOKEN}` } });
+const json = await res.json();
+if (!res.ok) throw new Error(`Airtable get failed: ${res.status} ${JSON.stringify(json)}`);
 });
